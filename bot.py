@@ -17,15 +17,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
-# ИЗМЕНЕНО: Обновлен ID целевого чата
 TARGET_CHAT_ID = int(os.getenv('TARGET_CHAT_ID'))
 
 ALLOWED_USER_IDS = json.loads(os.getenv("ALLOWED_USER_IDS", "[]"))
+# НОВОЕ: кто может менять список валют. Если пусто — могут все из ALLOWED_USER_IDS.
+ADMIN_USER_IDS = json.loads(os.getenv("ADMIN_USER_IDS", "[]"))
+# Используется только при первом запуске для переноса ответственных в currencies.json
 CURRENCY_MENTIONS = json.loads(os.getenv("CURRENCY_MENTIONS", "{}"))
 
 KAM_USERNAME = os.getenv('KAM_USERNAME')
 
 REPORTS_FILE = 'anomaly_reports.json'
+CURRENCIES_FILE = 'currencies.json'  # НОВОЕ: валюты и ответственные
+DEFAULT_CURRENCIES = ['KGS', 'UZS', 'RUB', 'ARS', 'AZN', 'AUD', 'AED', 'EGP', 'DOP', 'CNY', 'DZD', 'CRC']
+CURRENCY_CODE_RE = re.compile(r'^[A-Z0-9]{2,10}$')
+
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 SCHEDULE_TIME_MSK = datetime.time(10, 0)
 last_run_date_msk = None
@@ -35,6 +41,8 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # --- Управление данными ---
 user_data = {}
 anomaly_reports = {}
+currencies_config = {}  # {'KGS': '@ivan, @petr', ...} — порядок ключей = порядок кнопок
+currencies_lock = threading.Lock()
 
 
 def save_reports():
@@ -63,6 +71,51 @@ def load_reports():
     else:
         anomaly_reports = {}
         logging.info("Файл с инцидентами не найден, начинаем с чистого листа.")
+
+
+# --- НОВОЕ: Управление валютами ---
+def save_currencies():
+    with currencies_lock:
+        with open(CURRENCIES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(currencies_config, f, ensure_ascii=False, indent=4)
+    logging.info("Список валют сохранён.")
+
+
+def load_currencies():
+    """Загружает валюты из файла. При первом запуске создаёт файл из списка по умолчанию + .env."""
+    global currencies_config
+    if os.path.exists(CURRENCIES_FILE):
+        try:
+            with open(CURRENCIES_FILE, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                currencies_config = {str(k).upper(): (v or '') for k, v in loaded.items()}
+                logging.info(f"Загружено валют: {len(currencies_config)}.")
+                return
+            logging.error("currencies.json имеет неверный формат, используем значения по умолчанию.")
+        except json.JSONDecodeError:
+            logging.error("Ошибка чтения currencies.json, используем значения по умолчанию.")
+
+    # Первый запуск: переносим данные из DEFAULT_CURRENCIES и CURRENCY_MENTIONS
+    currencies_config = {c: CURRENCY_MENTIONS.get(c, '') for c in DEFAULT_CURRENCIES}
+    for c, mention in CURRENCY_MENTIONS.items():
+        currencies_config.setdefault(c.upper(), mention)
+    save_currencies()
+    logging.info("Создан currencies.json из значений по умолчанию.")
+
+
+def get_mention(currency):
+    return currencies_config.get(currency, '') or ''
+
+
+def is_admin(user_id):
+    return user_id in ADMIN_USER_IDS if ADMIN_USER_IDS else True
+
+
+def parse_mentions(parts):
+    """Склеивает ответственных из аргументов команды: '@a, @b' / '@a @b' -> '@a, @b'."""
+    raw = ' '.join(parts).replace(',', ' ').split()
+    return ', '.join(raw)
 
 
 def escape_markdown(text: str) -> str:
@@ -137,19 +190,20 @@ def create_platform_menu(selected_platforms=[]):
 
 
 def create_currency_menu(selected_currencies=[]):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    currencies = ['KGS', 'UZS', 'RUB', 'ARS', 'AZN', 'AUD', 'AED', 'EGP', 'DOP', 'CNY', 'DZD', 'CRC']
-    for i in range(0, len(currencies), 2):
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    currencies = list(currencies_config.keys())  # ИЗМЕНЕНО: берём из currencies.json
+    per_row = 3
+    for i in range(0, len(currencies), per_row):
         row_btns = [types.InlineKeyboardButton(f"✔ {c}" if c in selected_currencies else c,
-                                               callback_data=f'toggle_currency_{c}') for c in currencies[i:i + 2]]
-        markup.add(*row_btns)
+                                               callback_data=f'toggle_currency_{c}') for c in currencies[i:i + per_row]]
+        markup.row(*row_btns)
 
     # Кнопка Тех. работ
-    markup.add(types.InlineKeyboardButton('🛠 Тех. работы (Вся площадка)', callback_data='tech_maintenance'))
+    markup.row(types.InlineKeyboardButton('🛠 Тех. работы (Вся площадка)', callback_data='tech_maintenance'))
 
     if selected_currencies:
-        markup.add(types.InlineKeyboardButton('Далее ➡️', callback_data='currencies_done'))
-    markup.add(types.InlineKeyboardButton('⬅️ Назад', callback_data='back_to_platform'),
+        markup.row(types.InlineKeyboardButton('Далее ➡️', callback_data='currencies_done'))
+    markup.row(types.InlineKeyboardButton('⬅️ Назад', callback_data='back_to_platform'),
                types.InlineKeyboardButton('❌ Отменить', callback_data='cancel_report'))
     return markup
 
@@ -233,14 +287,24 @@ def create_persistent_keyboard():
 
 # --- Обработчики команд ---
 
+HELP_TEXT = (
+    "Система мониторинга готова к работе. Выберите 'Главное меню'.\n\n"
+    "Управление валютами:\n"
+    "/currencies — список валют и ответственных\n"
+    "/addcurrency КОД @user1 @user2 — добавить валюту\n"
+    "/setresp КОД @user1 @user2 — сменить ответственных\n"
+    "/setresp КОД - — убрать ответственных\n"
+    "/removecurrency КОД — удалить валюту"
+)
+
+
 @bot.message_handler(commands=['start', 'help'])
 @access_control
 def send_welcome(message):
     user_id = message.from_user.id
     user_data[user_id] = {}
     if message.chat.type == 'private':
-        bot.send_message(message.chat.id, "Система мониторинга готова к работе. Выберите 'Главное меню'.",
-                         reply_markup=create_persistent_keyboard())
+        bot.send_message(message.chat.id, HELP_TEXT, reply_markup=create_persistent_keyboard())
 
 
 @bot.message_handler(commands=['nightinfo'])
@@ -253,6 +317,84 @@ def handle_night_info_command(message):
         bot.reply_to(message, "Сводка отправлена в основной чат.")
     else:
         bot.reply_to(message, "Не удалось отправить сводку. Проверьте логи.")
+
+
+# --- НОВОЕ: Команды управления валютами ---
+# Важно: они должны быть объявлены ДО handle_text, который ловит все сообщения.
+
+@bot.message_handler(commands=['currencies'])
+@access_control
+def handle_list_currencies(message):
+    if not currencies_config:
+        bot.reply_to(message, "Список валют пуст. Добавьте: /addcurrency КОД @user")
+        return
+    lines = [f"{c} — {m if m else 'не назначен'}" for c, m in currencies_config.items()]
+    bot.reply_to(message, f"Валюты ({len(lines)}):\n" + "\n".join(lines))
+
+
+@bot.message_handler(commands=['addcurrency'])
+@access_control
+def handle_add_currency(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Недостаточно прав для изменения валют.")
+        return
+    parts = message.text.split()[1:]
+    if not parts:
+        bot.reply_to(message, "Формат: /addcurrency КОД @user1 @user2\nПример: /addcurrency TRY @ivan_petrov")
+        return
+    code = parts[0].upper()
+    if not CURRENCY_CODE_RE.match(code):
+        bot.reply_to(message, "❌ Код валюты: 2–10 латинских букв/цифр, например TRY или USDT.")
+        return
+    if code in currencies_config:
+        bot.reply_to(message, f"Валюта {code} уже есть. Чтобы сменить ответственных: /setresp {code} @user")
+        return
+    mentions = parse_mentions(parts[1:])
+    currencies_config[code] = mentions
+    save_currencies()
+    logging.info(f"User {message.from_user.id} added currency {code} ({mentions}).")
+    bot.reply_to(message, f"✅ Валюта {code} добавлена. Ответственные: {mentions or 'не назначены'}")
+
+
+@bot.message_handler(commands=['setresp', 'setresponsible'])
+@access_control
+def handle_set_responsible(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Недостаточно прав для изменения валют.")
+        return
+    parts = message.text.split()[1:]
+    if len(parts) < 2:
+        bot.reply_to(message, "Формат: /setresp КОД @user1 @user2\nУбрать ответственных: /setresp КОД -")
+        return
+    code = parts[0].upper()
+    if code not in currencies_config:
+        bot.reply_to(message, f"❌ Валюты {code} нет. Добавьте её: /addcurrency {code} @user")
+        return
+    mentions = '' if parts[1:] == ['-'] else parse_mentions(parts[1:])
+    currencies_config[code] = mentions
+    save_currencies()
+    logging.info(f"User {message.from_user.id} set responsible for {code}: {mentions}.")
+    bot.reply_to(message, f"✅ {code}: ответственные — {mentions or 'не назначены'}")
+
+
+@bot.message_handler(commands=['removecurrency'])
+@access_control
+def handle_remove_currency(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Недостаточно прав для изменения валют.")
+        return
+    parts = message.text.split()[1:]
+    if not parts:
+        bot.reply_to(message, "Формат: /removecurrency КОД")
+        return
+    code = parts[0].upper()
+    if code not in currencies_config:
+        bot.reply_to(message, f"❌ Валюты {code} нет в списке.")
+        return
+    currencies_config.pop(code)
+    save_currencies()
+    logging.info(f"User {message.from_user.id} removed currency {code}.")
+    bot.reply_to(message, f"🗑 Валюта {code} удалена. Уже открытые инциденты по ней не затронуты.")
 
 
 @bot.message_handler(func=lambda message: message.text == '🏠 Главное меню')
@@ -294,8 +436,7 @@ def handle_text(message):
             # Для тех. работ сразу к подтверждению (минуя мерчантов)
             data['awaiting_confirmation'] = True
             preview_text = generate_preview_text(data, is_resolved_immediately=False)
-            markup = create_confirmation_menu(
-                is_resolved_immediately=False)  # Используем False, чтобы кнопка назад вела к описанию (изменено в create_confirmation_menu)
+            markup = create_confirmation_menu(is_resolved_immediately=False)
         else:
             data['awaiting_merchant_notification'] = True
             # Для обычного флоу
@@ -688,8 +829,8 @@ def generate_preview_text(data, is_resolved_immediately=False):
     merchant_notified = data.get('merchant_notified', False)
     is_tech = data.get('is_tech_maintenance', False)
 
-    mentions = {escape_markdown(CURRENCY_MENTIONS.get(c)) for c in data.get('currencies', []) if
-                CURRENCY_MENTIONS.get(c)}
+    # ИЗМЕНЕНО: ответственные берутся из currencies.json
+    mentions = {escape_markdown(get_mention(c)) for c in data.get('currencies', []) if get_mention(c)}
     responsible_text = f"— **Ответственные:** {', '.join(mentions)}\n" if mentions and not is_tech else ""
     merchant_status_text = ""
     kam_mention_text = ""
@@ -723,7 +864,7 @@ def generate_preview_text(data, is_resolved_immediately=False):
 
 def generate_final_report_text(platforms_str, currency, reason, description_raw, merchant_notified, is_resolved,
                                is_tech=False):
-    mention = escape_markdown(CURRENCY_MENTIONS.get(currency, ''))
+    mention = escape_markdown(get_mention(currency))  # ИЗМЕНЕНО
     responsible_text = f"— **Ответственный сотрудник:** {mention}\n" if mention and not is_tech else ""
     merchant_status_text = ""
     kam_mention_text = ""
@@ -756,6 +897,21 @@ def generate_final_report_text(platforms_str, currency, reason, description_raw,
 
 if __name__ == '__main__':
     load_reports()
+    load_currencies()  # НОВОЕ
+
+    # НОВОЕ: подсказки команд в меню Telegram (только в личке)
+    try:
+        bot.set_my_commands([
+            types.BotCommand('start', 'Запуск и справка'),
+            types.BotCommand('currencies', 'Список валют и ответственных'),
+            types.BotCommand('addcurrency', 'Добавить валюту: КОД @user'),
+            types.BotCommand('setresp', 'Сменить ответственных: КОД @user'),
+            types.BotCommand('removecurrency', 'Удалить валюту: КОД'),
+            types.BotCommand('nightinfo', 'Отправить ночную сводку'),
+        ], scope=types.BotCommandScopeAllPrivateChats())
+    except Exception as e:
+        logging.warning(f"Не удалось установить список команд: {e}")
+
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     logging.info("Бот запущен...")
